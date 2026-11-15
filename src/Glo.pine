@@ -1,0 +1,276 @@
+
+ //@version=6
+strategy("Project Glo v0.3 | Powell 10 AM", overlay=true,
+     pyramiding=0, process_orders_on_close=true,
+     default_qty_type=strategy.fixed,
+     default_qty_value=1,
+     max_labels_count=500)
+
+// PROJECT GLO v0.3
+// MNQ futures — backtesting only.
+// Use on the 1-minute chart to monitor 1m, 3m and 5m.
+
+string TZ = "America/New_York"
+
+// SETTINGS
+minRR = input.float(3.5, "Minimum RR", minval=1, step=0.25)
+tpBuffer = input.float(5.0, "Liquidity TP buffer (points)", minval=0, step=0.25)
+slBuffer = input.float(1.0, "Structural SL buffer (points)", minval=0, step=0.25)
+contracts = input.int(1, "Simulated MNQ contracts", minval=1)
+pivotStrength = input.int(3, "Structural pivot strength (temporary)", minval=2, maxval=10)
+allowEqual = input.bool(true, "Allow close exactly on opening line")
+showDebug = input.bool(true, "Show 10 AM open verification")
+showSignals = input.bool(true, "Show retest confirmations")
+
+if not (timeframe.isminutes and timeframe.multiplier == 1)
+    runtime.error("Use Glo v0.3 on the 1-minute chart for combined 1m/3m/5m detection.")
+
+// TIME AND DAILY RESET
+int dayKey = year(time, TZ) * 10000 +
+     month(time, TZ) * 100 + dayofmonth(time, TZ)
+bool newDay = na(dayKey[1]) or dayKey != dayKey[1]
+bool atTen = hour(time, TZ) == 10 and minute(time, TZ) == 0
+
+var float tenOpen = na
+var bool traded = false
+
+if newDay
+    tenOpen := na
+    traded := false
+
+// Capture the OPEN of the candle beginning at 10:00 AM.
+if atTen
+    tenOpen := open
+
+plot(tenOpen, "10 AM Opening Price",
+     color=color.yellow, linewidth=2,
+     style=plot.style_linebr)
+
+plotshape(showDebug and atTen ? open : na,
+     title="10 AM Exact Open",
+     style=shape.circle,
+     location=location.absolute,
+     color=color.aqua,
+     size=size.small,
+     text="OPEN")
+
+if showDebug and atTen
+    label.new(bar_index, open,
+         "OPEN: " + str.tostring(open, format.mintick),
+         style=label.style_label_left,
+         color=color.yellow,
+         textcolor=color.black,
+         size=size.tiny)
+
+// RETEST DETECTOR
+// Runs independently on each requested timeframe.
+//  1 = bullish confirmation
+// -1 = bearish confirmation
+//  0 = no confirmation
+
+f_detect() =>
+    int d = year(time, TZ) * 10000 +
+         month(time, TZ) * 100 + dayofmonth(time, TZ)
+    bool reset = na(d[1]) or d != d[1]
+    bool ten = hour(time, TZ) == 10 and minute(time, TZ) == 0
+
+    var float level = na
+    var bool seenAbove = false
+    var bool seenBelow = false
+    var float longRetestHigh = na
+    var float shortRetestLow = na
+    var bool usedLong = false
+    var bool usedShort = false
+
+    if reset
+        level := na
+        seenAbove := false
+        seenBelow := false
+        longRetestHigh := na
+        shortRetestLow := na
+        usedLong := false
+        usedShort := false
+
+    if ten
+        level := open
+
+    int result = 0
+
+    if not na(level)
+        bool above = close > level
+        bool below = close < level
+
+        bool atOrBelow = allowEqual ? close <= level : below
+        bool atOrAbove = allowEqual ? close >= level : above
+
+        // Confirm using the most recent qualifying retest candle.
+        bool longConfirm = not na(longRetestHigh) and
+             close > longRetestHigh and above and not usedLong
+
+        bool shortConfirm = not na(shortRetestLow) and
+             close < shortRetestLow and below and not usedShort
+
+        if longConfirm and not shortConfirm
+            result := 1
+            usedLong := true
+            longRetestHigh := na
+        else if shortConfirm and not longConfirm
+            result := -1
+            usedShort := true
+            shortRetestLow := na
+
+        // Retest: price returns to or across the opening level
+        // after previously closing on the opposite side.
+        if result == 0
+            if seenAbove and atOrBelow and not usedLong
+                longRetestHigh := high
+
+            if seenBelow and atOrAbove and not usedShort
+                shortRetestLow := low
+
+        if above
+            seenAbove := true
+        if below
+            seenBelow := true
+
+    result
+
+// INDEPENDENT TIMEFRAME SIGNALS
+sig1 = f_detect()
+
+sig3 = request.security(syminfo.tickerid, "3",
+     f_detect(), gaps=barmerge.gaps_off,
+     lookahead=barmerge.lookahead_off)
+
+sig5 = request.security(syminfo.tickerid, "5",
+     f_detect(), gaps=barmerge.gaps_off,
+     lookahead=barmerge.lookahead_off)
+
+// Accept higher-timeframe signals only at their bar close.
+bool closed3 = time_close == time_close("3")
+bool closed5 = time_close == time_close("5")
+
+bool bull1 = sig1 == 1
+bool bear1 = sig1 == -1
+bool bull3 = closed3 and sig3 == 1
+bool bear3 = closed3 and sig3 == -1
+bool bull5 = closed5 and sig5 == 1
+bool bear5 = closed5 and sig5 == -1
+
+bool bullish = bull1 or bull3 or bull5
+bool bearish = bear1 or bear3 or bear5
+
+// Do not trade conflicting simultaneous signals.
+bool longSignal = bullish and not bearish
+bool shortSignal = bearish and not bullish
+
+string signalTF = bull1 or bear1 ? "1m" :
+     bull3 or bear3 ? "3m" :
+     bull5 or bear5 ? "5m" : ""
+
+// STRUCTURAL LIQUIDITY LEVELS
+// Provisional pivot-based approximation.
+ph5 = request.security(syminfo.tickerid, "5",
+     ta.pivothigh(high, pivotStrength, pivotStrength),
+     lookahead=barmerge.lookahead_off)
+
+pl5 = request.security(syminfo.tickerid, "5",
+     ta.pivotlow(low, pivotStrength, pivotStrength),
+     lookahead=barmerge.lookahead_off)
+
+ph15 = request.security(syminfo.tickerid, "15",
+     ta.pivothigh(high, pivotStrength, pivotStrength),
+     lookahead=barmerge.lookahead_off)
+
+pl15 = request.security(syminfo.tickerid, "15",
+     ta.pivotlow(low, pivotStrength, pivotStrength),
+     lookahead=barmerge.lookahead_off)
+
+var float h5 = na
+var float l5 = na
+var float h15 = na
+var float l15 = na
+
+if not na(ph5)
+    h5 := ph5
+if not na(pl5)
+    l5 := pl5
+if not na(ph15)
+    h15 := ph15
+if not na(pl15)
+    l15 := pl15
+
+// Find nearest confirmed structural levels on either side.
+float aboveLevel = na
+float belowLevel = na
+
+if not na(h5) and h5 > close
+    aboveLevel := h5
+
+if not na(h15) and h15 > close
+    aboveLevel := na(aboveLevel) ? h15 :
+         math.min(aboveLevel, h15)
+
+if not na(l5) and l5 < close
+    belowLevel := l5
+
+if not na(l15) and l15 < close
+    belowLevel := na(belowLevel) ? l15 :
+         math.max(belowLevel, l15)
+
+// ENTRY ENGINE
+bool ready = not na(tenOpen) and not traded and
+     strategy.position_size == 0 and barstate.isconfirmed
+
+if ready and not na(aboveLevel) and not na(belowLevel)
+
+    if longSignal
+        float sl = belowLevel - slBuffer
+        float tp = aboveLevel - tpBuffer
+        float risk = close - sl
+        float reward = tp - close
+
+        if risk > 0 and reward > 0 and reward / risk >= minRR
+            strategy.entry("Glo Long", strategy.long, qty=contracts)
+            strategy.exit("Glo Long Exit", "Glo Long",
+                 stop=sl, limit=tp)
+            traded := true
+
+    else if shortSignal
+        float sl = aboveLevel + slBuffer
+        float tp = belowLevel + tpBuffer
+        float risk = sl - close
+        float reward = close - tp
+
+        if risk > 0 and reward > 0 and reward / risk >= minRR
+            strategy.entry("Glo Short", strategy.short, qty=contracts)
+            strategy.exit("Glo Short Exit", "Glo Short",
+                 stop=sl, limit=tp)
+            traded := true
+
+// VISUAL CONFIRMATION MARKERS
+plotshape(showSignals and longSignal,
+     title="Bullish Retest Confirmed",
+     style=shape.triangleup,
+     location=location.belowbar,
+     color=color.lime,
+     size=size.tiny,
+     text="LONG?")
+
+plotshape(showSignals and shortSignal,
+     title="Bearish Retest Confirmed",
+     style=shape.triangledown,
+     location=location.abovebar,
+     color=color.red,
+     size=size.tiny,
+     text="SHORT?")
+
+if showSignals and (longSignal or shortSignal)
+    label.new(bar_index,
+         longSignal ? low : high,
+         signalTF,
+         style=longSignal ? label.style_label_up :
+              label.style_label_down,
+         color=longSignal ? color.green : color.red,
+         textcolor=color.white,
+         size=size.tiny)
