@@ -1,11 +1,12 @@
-
+<p align="center">
+  <img src="glo-banner.png" alt="Project Glo Banner" width="100%">
+</p>
 <div align="center">
 
 # PROJECT GLO
 
 ### Algorithmic Trading • MNQ Futures • Pine Script v6
 
-**Automating precision. One setup at a time.**
 
 ![Status](https://img.shields.io/badge/Status-In%20Development-orange)
 ![Version](https://img.shields.io/badge/Version-v0.3-blue)
